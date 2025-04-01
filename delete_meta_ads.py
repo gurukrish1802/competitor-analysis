@@ -53,7 +53,7 @@ def main():
         print("\n=== Meta Ads Deletion Script ===")
         
         # Get page ID from user input
-        page_id = "106729994530632"
+        page_id = "324603558250502"
         
         if not page_id:
             print("❌ Page ID is required")

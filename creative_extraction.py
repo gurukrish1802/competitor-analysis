@@ -1715,10 +1715,14 @@ class CreativeAnalysis:
             finally:
                 client.close()
 
-    async def docreativeanalysis(self, ads_data,page_id):
+    async def docreativeanalysis(self, ads_data, page_id):
         try:
             print("\n=== Starting Creative Analysis ===")
             print(f"Initializing analysis for {len(ads_data)} ads")
+            
+            # Delete existing data first
+            print("\n=== Deleting Existing Data ===")
+            await self.delete_existing_data(page_id)
             
             await self.initialize()
             if not ads_data:
@@ -1726,7 +1730,7 @@ class CreativeAnalysis:
                 return {"success": False, "error": "No ads data found"}
 
             print("\n=== Processing Ads ===")
-            processed_ads = await self.process_ads_data(ads_data,page_id)
+            processed_ads = await self.process_ads_data(ads_data, page_id)
             
             # Save raw data for reference
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1900,6 +1904,62 @@ class CreativeAnalysis:
         except Exception as e:
             print(f"❌ Error in brand analysis: {str(e)}")
             traceback.print_exc()
+
+    async def delete_existing_data(self, page_id):
+        """Delete existing data from Meta_ads and Elasticsearch for a given page_id"""
+        try:
+            # Delete from MongoDB Meta_ads collection
+            mongo_client = AsyncIOMotorClient(MONGO_URI)
+            db = mongo_client[database_name]
+            meta_ads_collection = db['Meta_ads']
+            
+            # Delete all documents with matching page_id
+            delete_result = await meta_ads_collection.delete_many({"page_id": str(page_id)})
+            print(f"Deleted {delete_result.deleted_count} documents from Meta_ads collection")
+            
+            # Delete from Elasticsearch if enabled
+            if self.es_enabled and self.es_client:
+                try:
+                    # Delete from image index
+                    image_delete_result = await self.es_client.delete_by_query(
+                        index=ELASTICSEARCH_IMAGE_INDEX,
+                        body={
+                            "query": {
+                                "term": {
+                                    "page_id": str(page_id)
+                                }
+                            }
+                        },
+                        refresh=True  # Force refresh to ensure deletion is complete
+                    )
+                    print(f"Deleted {image_delete_result['deleted']} documents from image index")
+                    
+                    # Delete from video index
+                    video_delete_result = await self.es_client.delete_by_query(
+                        index=ELASTICSEARCH_VIDEO_INDEX,
+                        body={
+                            "query": {
+                                "term": {
+                                    "page_id": str(page_id)
+                                }
+                            }
+                        },
+                        refresh=True  # Force refresh to ensure deletion is complete
+                    )
+                    print(f"Deleted {video_delete_result['deleted']} documents from video index")
+                    
+                except Exception as es_error:
+                    print(f"❌ Error deleting from Elasticsearch: {str(es_error)}")
+                    traceback.print_exc()
+                
+            print(f"✅ Successfully deleted existing data for page_id: {page_id}")
+            
+        except Exception as e:
+            print(f"❌ Error deleting existing data: {str(e)}")
+            traceback.print_exc()
+        finally:
+            if 'mongo_client' in locals():
+                mongo_client.close()
 
 @asynccontextmanager
 async def analysis_session(brand_id, brand_url=None):
