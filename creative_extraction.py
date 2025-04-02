@@ -201,6 +201,7 @@ class CreativeAnalysis:
         self.brand_url = brand_url
         self.mongo_client = AsyncIOMotorClient(MONGO_URI)
         self.db = self.mongo_client[database_name]
+        self.test_db = self.mongo_client['test']  # Add test database connection
         self.http_session = None
         self.es_client = None
         self.currently_processing = set()
@@ -217,7 +218,7 @@ class CreativeAnalysis:
         ]
         self.key_counters = {key: 0 for key in self.api_keys}
         self.key_timeouts = {}
-        self.brand_analyzer = BrandAnalyzer()  # Initialize BrandAnalyzer
+        self.brand_analyzer = BrandAnalyzer()
 
     async def initialize(self):
         try:
@@ -1135,6 +1136,15 @@ class CreativeAnalysis:
             self.currently_processing.add(url)
 
         try:
+            # Only update when starting to process this creative
+            await self.update_analytics_status(
+                page_id=ad_doc.get('page_id'),
+                stage="analysis",
+                status="processing",
+                creative_url=url,
+                media_type=media_type  # Pass the media type
+            )
+            
             # Generate hash if not provided
             if not hash_value:
                 if media_type == "video":
@@ -1146,12 +1156,14 @@ class CreativeAnalysis:
             existing_entities = await self.check_hash_exists(hash_value, ad_doc.get('page_id'))
             if existing_entities:
                 print(f"Using existing analysis for {url} (hash: {hash_value})")
+                # Don't update status for reused entries - we're not doing actual analysis
+                
                 extraction_result = {
                     "url": url,
                     "media_type": media_type,
                     "extracted_entities": existing_entities,
                     "ad_id": ad_id,
-                    "page_id": str(ad_doc.get('page_id')),  # Ensure page_id is string
+                    "page_id": str(ad_doc.get('page_id')),
                     "status": ad_doc.get('status'),
                     "platforms": ad_doc.get('platforms'),
                     "advertiser": ad_doc.get('advertiser'),
@@ -1174,11 +1186,20 @@ class CreativeAnalysis:
 
                 if self.es_enabled:
                     if media_type == "image":
-                        self.es_image_batch.append(extraction_result)  # Remove doc wrapper
+                        self.es_image_batch.append(extraction_result)
                     else:
-                        self.es_video_batch.append(extraction_result)  # Remove doc wrapper
+                        self.es_video_batch.append(extraction_result)
 
                 await self.save_creative_analysis(hash_value, existing_entities, ad_doc.get('page_id'), url)
+
+                # Update status to completed for tracking, even though we reused analysis
+                await self.update_analytics_status(
+                    page_id=ad_doc.get('page_id'),
+                    stage="analysis",
+                    status="completed",
+                    creative_url=url,
+                    media_type=media_type
+                )
 
                 return extraction_result, media_id
 
@@ -1191,12 +1212,30 @@ class CreativeAnalysis:
 
             if not entities:
                 print(f"Failed to extract entities for {url}")
+                # Update status to failed for this creative
+                await self.update_analytics_status(
+                    page_id=ad_doc.get('page_id'),
+                    stage="analysis",
+                    status="failed",
+                    creative_url=url,
+                    media_type=media_type,
+                    error="Failed to extract entities"
+                )
                 return None, None
+
+            # Update status to completed for this specific creative
+            await self.update_analytics_status(
+                page_id=ad_doc.get('page_id'),
+                stage="analysis",
+                status="completed",
+                creative_url=url,
+                media_type=media_type
+            )
 
             extraction_result.update({
                 "extracted_entities": entities,
                 "ad_id": ad_id,
-                "page_id": str(ad_doc.get('page_id')),  # Ensure page_id is string
+                "page_id": str(ad_doc.get('page_id')),
                 "status": ad_doc.get('status'),
                 "platforms": ad_doc.get('platforms'),
                 "advertiser": ad_doc.get('advertiser'),
@@ -1219,14 +1258,26 @@ class CreativeAnalysis:
 
             if self.es_enabled:
                 if media_type == "image":
-                    self.es_image_batch.append(extraction_result)  # Remove doc wrapper
+                    self.es_image_batch.append(extraction_result)
                 else:
-                    self.es_video_batch.append(extraction_result)  # Remove doc wrapper
+                    self.es_video_batch.append(extraction_result)
 
             await self.save_creative_analysis(hash_value, entities, ad_doc.get('page_id'), url)
 
             return extraction_result, media_id
 
+        except Exception as e:
+            print(f"Error processing media: {str(e)}")
+            # Update status to error for this creative
+            await self.update_analytics_status(
+                page_id=ad_doc.get('page_id'),
+                stage="analysis",
+                status="error",
+                creative_url=url,
+                media_type=media_type,
+                error=str(e)
+            )
+            return None, None
         finally:
             async with self.processing_lock:
                 self.currently_processing.remove(url)
@@ -1258,7 +1309,7 @@ class CreativeAnalysis:
         finally:
             client.close()
 
-    async def process_ad(self, ad,page_id):
+    async def process_ad(self, ad, page_id):
         if not ad:
             return None
 
@@ -1285,16 +1336,47 @@ class CreativeAnalysis:
 
         media_details = ad.get('media_details', [])
         processed_media_details = []
+        total_items = 0
+        processed_items = 0
+
+        # Count total items to process for progress tracking
+        for media in media_details:
+            if media.get('type') == 'carousel':
+                total_items += len(media.get('items', []))
+            else:
+                total_items += 1
+                
+        print(f"Processing ad {ad.get('library_id')} with {total_items} media items")
 
         for media in media_details:
             media_type = media.get('type')
             
             if media_type == 'carousel':
                 # Process each item in the carousel
-                processed_items = []
+                carousel_processed_items = []
                 carousel_entities = []
-                for item in media.get('items', []):
+                carousel_items = media.get('items', [])
+                
+                # Update status for carousel processing start
+                await self.update_analytics_status(
+                    page_id=page_id,
+                    stage="analysis",
+                    status="processing_carousel",
+                    creative_url=f"Carousel with {len(carousel_items)} items",
+                    media_type="carousel"
+                )
+                
+                for item in carousel_items:
                     if 'image_src' in item:
+                        # Update status with the carousel item type
+                        await self.update_analytics_status(
+                            page_id=page_id,
+                            stage="analysis",
+                            status="processing",
+                            creative_url=item['image_src'],
+                            media_type="carousel_item"
+                        )
+                        
                         result, _ = await self.process_media(
                             item['image_src'],
                             'image',
@@ -1303,16 +1385,26 @@ class CreativeAnalysis:
                         )
                         if result:
                             # For carousel items, only store creative_url and extracted_entities
-                            processed_items.append({
+                            carousel_processed_items.append({
                                 'creative_url': item['image_src'],
                                 'extracted_entities': result.get('extracted_entities')
                             })
                             carousel_entities.append(result.get('extracted_entities'))
+                            processed_items += 1
+                        
+                # Update status for carousel processing complete
+                await self.update_analytics_status(
+                    page_id=page_id,
+                    stage="analysis",
+                    status="carousel_completed",
+                    creative_url=f"Carousel with {len(carousel_processed_items)} processed items",
+                    media_type="carousel"
+                )
                 
                 # Create processed carousel media with simplified structure and optional fields at carousel level
                 processed_carousel = {
                     'type': 'carousel',
-                    'items': processed_items,
+                    'items': carousel_processed_items,
                     'status': ad.get('status'),
                     'start_date': ad.get('start_date'),
                     'end_date': ad.get('end_date'),
@@ -1364,6 +1456,7 @@ class CreativeAnalysis:
                         media['timestamp'] = ad.get('timestamp')
                         media['page_id'] = page_id
                         processed_media_details.append(media)
+                        processed_items += 1
                         
                         # Add video analysis to extracted_entities
                         ad_doc['extracted_entities'].append({
@@ -1400,6 +1493,7 @@ class CreativeAnalysis:
                         media['timestamp'] = ad.get('timestamp')
                         media['page_id'] = page_id
                         processed_media_details.append(media)
+                        processed_items += 1
                         
                         # Add image analysis to extracted_entities
                         ad_doc['extracted_entities'].append({
@@ -1410,11 +1504,23 @@ class CreativeAnalysis:
 
         # Update the ad document with processed media details
         ad_doc['media_details'] = processed_media_details
+        
+        # Log completion info
+        print(f"Completed processing ad {ad.get('library_id')}: {processed_items}/{total_items} items processed")
+        
+        # Update status for ad completion
+        await self.update_analytics_status(
+            page_id=page_id,
+            stage="analysis",
+            status="ad_completed",
+            creative_url=f"Ad {ad.get('library_id')} ({processed_items}/{total_items} items)",
+            media_type="ad"
+        )
             
         return ad_doc
 
-    async def process_ads_data(self, ads_data,page_id):
-        ads_tasks = [self.process_ad(ad,page_id) for ad in ads_data]
+    async def process_ads_data(self, ads_data, page_id):
+        ads_tasks = [self.process_ad(ad, page_id) for ad in ads_data]
         processed_ads = await asyncio.gather(*ads_tasks, return_exceptions=True)
         return [ad for ad in processed_ads if ad and not isinstance(ad, Exception)]
 
@@ -1720,6 +1826,13 @@ class CreativeAnalysis:
             print("\n=== Starting Creative Analysis ===")
             print(f"Initializing analysis for {len(ads_data)} ads")
             
+            # Update analytics status to started
+            await self.update_analytics_status(
+                page_id=page_id,
+                stage="analysis",
+                status="started"
+            )
+            
             # Delete existing data first
             print("\n=== Deleting Existing Data ===")
             await self.delete_existing_data(page_id)
@@ -1727,10 +1840,43 @@ class CreativeAnalysis:
             await self.initialize()
             if not ads_data:
                 print("No ads data found to process")
+                # Update status to failed if no data
+                await self.update_analytics_status(
+                    page_id=page_id,
+                    stage="analysis",
+                    status="failed",
+                    error="No ads data found"
+                )
                 return {"success": False, "error": "No ads data found"}
 
             print("\n=== Processing Ads ===")
-            processed_ads = await self.process_ads_data(ads_data, page_id)
+            # Track progress
+            total_ads = len(ads_data)
+            current_ad = 0
+            
+            # Process ads one by one for better tracking
+            processed_ads = []
+            for ad in ads_data:
+                current_ad += 1
+                print(f"\n--- Processing Ad {current_ad}/{total_ads} (ID: {ad.get('library_id')}) ---")
+                
+                # Update progress status
+                await self.update_analytics_status(
+                    page_id=page_id,
+                    stage="analysis",
+                    status="processing_ad",
+                    creative_url=f"Ad {current_ad}/{total_ads} (ID: {ad.get('library_id')})",
+                    media_type="ad_batch"
+                )
+                
+                # Process this ad
+                processed_ad = await self.process_ad(ad, page_id)
+                if processed_ad:
+                    processed_ads.append(processed_ad)
+                
+                # Periodically flush batches to avoid memory issues
+                if current_ad % 5 == 0 or current_ad == total_ads:
+                    await self.flush_batches()
             
             # Save raw data for reference
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1738,21 +1884,53 @@ class CreativeAnalysis:
             print(f"Saving raw data with timestamp: {timestamp}")
             await self.save_json_file('raw_data', ads_data, timestamp)
             
+            # Calculate success metrics
+            success_count = len([ad for ad in processed_ads if ad])
+            failed_count = total_ads - success_count
+            success_rate = (success_count / total_ads * 100) if total_ads > 0 else 0
+            
             print("\n=== Analysis Summary ===")
-            print(f"Total ads processed: {len(processed_ads)}")
-            print(f"Successfully processed: {len([ad for ad in processed_ads if ad])}")
-            print(f"Failed to process: {len([ad for ad in processed_ads if not ad])}")
+            print(f"Total ads processed: {total_ads}")
+            print(f"Successfully processed: {success_count} ({success_rate:.1f}%)")
+            print(f"Failed to process: {failed_count}")
+
+            # Update analytics status to completed with summary
+            await self.update_analytics_status(
+                page_id=page_id,
+                stage="analysis",
+                status="completed"
+            )
+            
+            # Add detailed analysis completion data
+            await self.update_analysis_completion_data(
+                page_id=page_id,
+                total_ads=total_ads,
+                success_count=success_count,
+                failed_count=failed_count,
+                success_rate=success_rate,
+                timestamp=timestamp
+            )
 
             return {
                 "success": True,
                 "processed_ads": processed_ads,
-                "total_ads": len(ads_data),
-                "successfully_processed": len([ad for ad in processed_ads if ad]),
-                "failed_to_process": len([ad for ad in processed_ads if not ad])
+                "total_ads": total_ads,
+                "successfully_processed": success_count,
+                "failed_to_process": failed_count,
+                "success_rate": f"{success_rate:.1f}%"
             }
         except Exception as e:
             print(f"\n❌ Error in docreativeanalysis: {str(e)}")
             traceback.print_exc()
+            
+            # Update status to error
+            await self.update_analytics_status(
+                page_id=page_id,
+                stage="analysis",
+                status="error",
+                error=str(e)
+            )
+            
             return {"success": False, "error": f"Analysis failed: {str(e)}"}
         finally:
             try:
@@ -1761,6 +1939,40 @@ class CreativeAnalysis:
             except Exception as flush_error:
                 print(f"❌ Error flushing final batches: {flush_error}")
             await self.cleanup()
+            
+    async def update_analysis_completion_data(self, page_id, total_ads, success_count, failed_count, success_rate, timestamp):
+        """Update detailed completion data in MongoDB"""
+        try:
+            # Ensure page_id is a string
+            page_id = str(page_id)
+            collection = self.test_db['metaadslibraries']
+            
+            # Update document with detailed completion data
+            update_data = {
+                "$set": {
+                    "analytics_data.completion_details": {
+                        "total_ads": total_ads,
+                        "success_count": success_count,
+                        "failed_count": failed_count, 
+                        "success_rate": f"{success_rate:.1f}%",
+                        "completion_timestamp": datetime.now(),
+                        "raw_data_timestamp": timestamp
+                    },
+                    "analytics_data.analysis_complete": True
+                }
+            }
+            
+            await collection.update_one(
+                {"page_id": page_id},
+                update_data,
+                upsert=True
+            )
+            
+            print(f"✅ Updated detailed completion data for page {page_id}")
+            
+        except Exception as e:
+            print(f"❌ Error updating completion data: {str(e)}")
+            traceback.print_exc()
 
     async def save_json_file(self, file_type, data, timestamp):
         def object_id_converter(obj):
@@ -1960,6 +2172,80 @@ class CreativeAnalysis:
         finally:
             if 'mongo_client' in locals():
                 mongo_client.close()
+
+    async def update_analytics_status(self, page_id, stage, status, creative_url=None, error=None, media_type=None):
+        """Update analytics status in MongoDB - simple version that only tracks current creative"""
+        try:
+            # Ensure we have a valid page_id
+            if not page_id:
+                print("⚠️ No page_id provided for status update")
+                return
+                
+            # Ensure page_id is a string
+            page_id = str(page_id)
+            collection = self.test_db['metaadslibraries']
+            
+            # Base update data with common fields
+            update_data = {
+                "$set": {
+                    "analytics_data.current_stage": stage,
+                    "analytics_data.status": status,
+                    "analytics_data.last_updated": datetime.now()
+                }
+            }
+            
+            # Add different fields based on status type
+            if status == "processing" and creative_url:
+                # Only update current creative when processing a specific creative
+                update_data["$set"]["analytics_data.current_creative"] = creative_url
+                update_data["$set"]["analytics_data.current_media_type"] = media_type or "unknown"
+                print(f"⏳ Processing creative: {creative_url} (Type: {media_type})")
+                
+            elif status == "completed" and creative_url:
+                # For completed status with a creative, update last completed creative
+                update_data["$set"]["analytics_data.last_completed_creative"] = creative_url
+                update_data["$set"]["analytics_data.last_completed_time"] = datetime.now()
+                update_data["$inc"] = {"analytics_data.completed_count": 1}
+                print(f"✅ Completed analysis of: {creative_url}")
+                
+            elif status == "failed" and creative_url:
+                # For failed status, track failures
+                update_data["$set"]["analytics_data.last_failed_creative"] = creative_url
+                update_data["$set"]["analytics_data.last_error"] = error or "Unknown error"
+                update_data["$inc"] = {"analytics_data.failed_count": 1}
+                print(f"❌ Failed analysis of: {creative_url}")
+                
+            elif status == "error" and creative_url:
+                # For error status, track errors
+                update_data["$set"]["analytics_data.last_error_creative"] = creative_url
+                update_data["$set"]["analytics_data.last_error"] = error or "Unknown error"
+                update_data["$inc"] = {"analytics_data.error_count": 1}
+                print(f"❌ Error during analysis of: {creative_url}: {error}")
+                
+            elif status == "started":
+                # For overall process start
+                update_data["$set"]["analytics_data.start_time"] = datetime.now()
+                update_data["$set"]["analytics_data.completed_count"] = 0
+                update_data["$set"]["analytics_data.failed_count"] = 0
+                update_data["$set"]["analytics_data.error_count"] = 0
+                print(f"🚀 Started analysis for page: {page_id}")
+                
+            elif status == "completed" and not creative_url:
+                # For overall process completion
+                update_data["$set"]["analytics_data.complete_time"] = datetime.now()
+                update_data["$set"]["analytics_data.all_completed"] = True
+                print(f"🏁 Completed all analysis for page: {page_id}")
+                
+            # Update the document
+            await collection.update_one(
+                {"page_id": page_id},
+                update_data,
+                upsert=True
+            )
+                
+        except Exception as e:
+            print(f"❌ Error updating analytics status: {str(e)}")
+            traceback.print_exc()
 
 @asynccontextmanager
 async def analysis_session(brand_id, brand_url=None):
