@@ -17,6 +17,8 @@ from brand_analyser import BrandAnalyzer  # Import the BrandAnalyzer class
 import random
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+import threading
+from celery import Celery
 
 # Load environment variables
 load_dotenv()
@@ -26,12 +28,15 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://hawkyai:1R9hdMHgV7OsdueE@clust
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyAGRJYtNIXE__r5GzAtziZsftbDDeQWoIo")
 genai.configure(api_key=GEMINI_API_KEY)
 
+# Redis configuration for Celery
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
 # Database settings
 database_name = os.getenv("DATABASE_NAME", "competitor_analysis_test")
 
 # Elasticsearch settings
 ELASTICSEARCH_CLOUD_ID = os.getenv("ELASTICSEARCH_CLOUD_ID", "h-staging-ES:Y2VudHJhbGluZGlhLmF6dXJlLmVsYXN0aWMtY2xvdWQuY29tOjkyNDMkYjA5NWRmNDQ1OWQxNGUwMWI3MjMwMDU3ZjkwNTNhZTYkMmYzNjJkZTkyNWRjNDAzMGJiODU5NzFmNGFkZDA0ODQ=")
-ELASTICSEARCH_API_KEY = os.getenv("ELASTICSEARCH_API_KEY", "dlJLNlBaVUJGZ2lrTUZ4S0FnODY6OEl2MDNqME1UZENKZ2xYdWFlUzd3dw==")
+ELASTICSEARCH_API_KEY = os.getenv("ELASTICSEARCH_API_KEY", "dlJLNlBaVUJGZ2lrTUZ4S0FnODY6OEl2MDNqME1UZUNKZ2xYdWFlUzd3dw==")
 ELASTICSEARCH_IMAGE_INDEX = os.getenv("ELASTICSEARCH_IMAGE_INDEX", "image_competitors_analysis")
 ELASTICSEARCH_VIDEO_INDEX = os.getenv("ELASTICSEARCH_VIDEO_INDEX", "video_competitors_analysis")
 
@@ -156,9 +161,43 @@ VIDEO_RESPONSE_SCHEMA = {
         "product_features": {
             "type": "ARRAY",
             "items": {"type": "STRING"}
+        },
+        "messaging_angle": {
+            "type": "OBJECT",
+            "properties": {
+                "primary_approach": {"type": "STRING"},
+                "message_framing": {"type": "STRING"},
+                "messaging_tactics": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"}
+                },
+                "notable_aspects": {"type": "STRING"}
+            }
         }
     }
 }
+
+# Create Flask app
+app = Flask(__name__)
+
+# Configure Celery
+celery_app = Celery(
+    'creative_extraction',
+    broker=f"{REDIS_URL}/0",
+    backend=f"{REDIS_URL}/1"
+)
+
+# Celery configuration
+celery_app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+    task_track_started=True,
+    task_time_limit=3600,  # 1-hour timeout
+    worker_max_tasks_per_child=200
+)
 
 # Helper functions
 async def add_data_to_mongodb(collection_name, document):
@@ -698,6 +737,12 @@ class CreativeAnalysis:
         - Product Categories: Look for any products shown in the creative and match them with these categories:
         {json.dumps(product_categories, indent=2)}
         - Product Features: List all specific features, technologies, or benefits shown or mentioned in the creative
+        
+    20. Messaging Angle:
+        - The primary messaging approach used in the creative (e.g., emotional, rational, fear-based, solution-oriented)
+        - How the message is framed (e.g., problem-solution, aspiration, testimonial, storytelling)
+        - Specific messaging tactics used (e.g., social proof, scarcity, authority, urgency)
+        - Any unique or notable aspects of how the message is delivered
 
     """
 
@@ -745,6 +790,12 @@ class CreativeAnalysis:
         "audience_targeting": {
             "primary_audience": "main target audience",
             "demographic_indicators": ["visual demographic cues"]
+        },
+        "messaging_angle": {
+            "primary_approach": "primary messaging approach used",
+            "message_framing": "how the message is framed",
+            "messaging_tactics": ["specific messaging tactics used"],
+            "notable_aspects": "unique aspects of message delivery"
         }
     }
 
@@ -858,7 +909,8 @@ class CreativeAnalysis:
                     "- Unique Selling Proposition (USP)\n"
                     "- User Journey (Problem Framing, Solution Presentation, Benefit Demonstration)\n"
                     "- Product Categories (List all products shown in the video)\n"
-                    "- Product Features (List all features and benefits shown)\n\n"
+                    "- Product Features (List all features and benefits shown)\n"
+                    "- Messaging Angle (Primary approach, message framing, messaging tactics, notable aspects)\n\n"
                     "IMPORTANT: You MUST include both product_categories and product_features arrays in your response.\n"
                     "Respond strictly in JSON format with ALL above fields, with keys arranged in alphabetical order."
                 )
@@ -2256,10 +2308,10 @@ async def analysis_session(brand_id, brand_url=None):
     finally:
         await analysis.cleanup()
 
-async def run_async_analysis(brand_id, ads_data, brand_url,page_id):
+async def run_async_analysis(brand_id, ads_data, brand_url, page_id):
     try:
         async with analysis_session(brand_id, brand_url) as analysis:
-            test_data = await analysis.docreativeanalysis(ads_data,page_id)
+            test_data = await analysis.docreativeanalysis(ads_data, page_id)
             if not test_data:
                 raise ValueError("No test data returned from analysis")
             return {
@@ -2276,7 +2328,7 @@ async def run_async_analysis(brand_id, ads_data, brand_url,page_id):
         }
 
 async def fetch_ads_data_from_mongodb(page_id):
-    """Fetch ads data from MongoDB using page ID with date filtering"""
+    """Fetch ads data for a specific page from MongoDB"""
     try:
         client = AsyncIOMotorClient(MONGO_URI)
         db = client['extension_data']
@@ -2294,76 +2346,11 @@ async def fetch_ads_data_from_mongodb(page_id):
         print(f"\n=== Starting Ad Processing ===")
         print(f"Total ads found: {total_ads}")
         
-        # Get current date for null end dates
-        current_date = datetime.now()
+        # Process all ads without date filtering
+        print(f"\n=== Processing All Ads ===")
+        print(f"Total ads to process: {total_ads}")
         
-        # Calculate date threshold for 6 months
-        six_months_ago = current_date - timedelta(days=180)  # 6 months
-        
-        def parse_date(date_str):
-            """Parse date string in various formats"""
-            if not date_str:
-                return None
-            try:
-                # Try ISO format first
-                if isinstance(date_str, str):
-                    if 'Z' in date_str:
-                        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                    # Try DD MMM YYYY format
-                    try:
-                        return datetime.strptime(date_str, '%d %b %Y')
-                    except ValueError:
-                        # Try YYYY-MM-DD format
-                        try:
-                            return datetime.strptime(date_str, '%Y-%m-%d')
-                        except ValueError:
-                            # Try DD/MM/YYYY format
-                            try:
-                                return datetime.strptime(date_str, '%d/%m/%Y')
-                            except ValueError:
-                                print(f"Warning: Could not parse date string: {date_str}")
-                                return None
-                return date_str
-            except Exception as e:
-                print(f"Warning: Error parsing date {date_str}: {str(e)}")
-                return None
-        
-        print(f"\n=== Applying 6-Month Filter ===")
-        filtered_ads = []
-        
-        for ad in ads_data:
-            start_date = ad.get('start_date')
-            end_date = ad.get('end_date')
-            
-            # Skip if start_date is null
-            if not start_date:
-                print(f"Skipping ad {ad.get('library_id')}: Start date is null")
-                continue
-                
-            # Use current date if end_date is null
-            if not end_date:
-                end_date = current_date
-                
-            # Parse dates
-            start_date = parse_date(start_date)
-            end_date = parse_date(end_date)
-                
-            # Check if ad falls within 6-month range
-            if start_date and end_date:
-                if start_date >= six_months_ago:
-                    filtered_ads.append(ad)
-                else:
-                    print(f"Skipping ad {ad.get('library_id')}: Start date {start_date} is older than 6 months")
-        
-        filtered_count = len(filtered_ads)
-        print(f"\n=== Date Filtering Results ===")
-        print(f"Ads after 6-month filtering: {filtered_count}")
-        
-        print(f"\n=== Processing Summary ===")
-        print(f"Original ads: {total_ads}")
-        print(f"Final ads to process: {filtered_count}")
-        
-        return filtered_ads
+        return ads_data
         
     except Exception as e:
         print(f"Error fetching ads data: {e}")
@@ -2372,8 +2359,83 @@ async def fetch_ads_data_from_mongodb(page_id):
     finally:
         client.close()
 
-# Create Flask app
-app = Flask(__name__)
+# Define async function to encapsulate the analysis logic
+async def run_analysis(brand_id, page_id, url):
+    """
+    Asynchronous function to perform creative analysis.
+    
+    Args:
+        brand_id (str): The brand identifier.
+        page_id (str): The page identifier.
+        url (str): The URL to analyze.
+    
+    Returns:
+        dict: Result of the analysis.
+    
+    Raises:
+        ValueError: If ads data is not found or analysis fails.
+    """
+    try:
+        # Fetch ads data from MongoDB
+        ads_data = await fetch_ads_data_from_mongodb(page_id)
+        if not ads_data:
+            return {
+                "success": False,
+                "error": f"No ads data found for page ID: {page_id}"
+            }
+            
+        # Run analysis
+        result = await run_async_analysis(brand_id, ads_data, url, page_id)
+        
+        if not result or not result.get("success"):
+            error_message = result.get('error', 'Analysis failed without specific error') if result else 'No result returned'
+            return {
+                "success": False,
+                "error": error_message
+            }
+        else:
+            print(f"Analysis completed successfully for page_id: {page_id}")
+            print(f"Total ads: {result.get('data', {}).get('total_ads', 0)}")
+            print(f"Processed ads: {result.get('data', {}).get('successfully_processed', 0)}")
+            print(f"Failed ads: {result.get('data', {}).get('failed_to_process', 0)}")
+            
+            return result
+    except Exception as e:
+        print(f"Error in analysis: {str(e)}")
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+# Define the Celery task to perform the analysis
+@celery_app.task(name='perform_analysis', bind=True, max_retries=3)
+def perform_analysis(self, brand_id, page_id, url):
+    """
+    Celery task to execute the creative analysis in the background.
+    
+    Args:
+        brand_id (str): The brand identifier.
+        page_id (str): The page identifier.
+        url (str): The URL to analyze.
+    
+    Returns:
+        dict: Result of the analysis.
+    """
+    try:
+        # Run the async analysis function within the Celery task
+        result = asyncio.run(run_analysis(brand_id, page_id, url))
+        return result
+    except Exception as e:
+        print(f"Error in Celery task: {str(e)}")
+        traceback.print_exc()
+        # Retry the task on failure with a 60-second delay
+        raise self.retry(exc=e, countdown=60)
+
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({"success": True, "message": "Creative Extraction API is running"}), 200
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -2395,36 +2457,55 @@ def analyze():
         print(f"Page ID: {page_id}")
         print(f"URL: {url}")
         
-        # Fetch ads data
-        ads_data = asyncio.run(fetch_ads_data_from_mongodb(page_id))
+        # Use page_id as brand_id (consistent with original logic)
+        brand_id = page_id
         
-        if not ads_data:
-            return jsonify({"success": False, "error": f"No ads data found for page ID: {page_id}"}), 404
-            
-        # Run analysis
-        brand_id = page_id  # Using page_id as brand_id
-        result = asyncio.run(run_async_analysis(brand_id, ads_data, url, page_id))
+        # Queue the task with Celery
+        task = perform_analysis.delay(brand_id, page_id, url)
         
-        if not result or not result.get("success"):
-            error_message = result.get('error', 'Analysis failed without specific error') if result else 'No result returned'
-            return jsonify({"success": False, "error": error_message}), 500
-            
-        # Return successful result
+        # Return response with task ID
         return jsonify({
             "success": True,
+            "message": "Analysis queued",
             "page_id": page_id,
             "url": url,
-            "total_ads": result.get('data', {}).get('total_ads', 0),
-            "processed_ads": result.get('data', {}).get('successfully_processed', 0),
-            "failed_ads": result.get('data', {}).get('failed_to_process', 0)
-        })
+            "task_id": task.id,
+            "status": "processing"
+        }), 202  # 202 Accepted status code for queued tasks
         
     except Exception as e:
         print(f"Error processing request: {str(e)}")
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
+# Flask endpoint to check task status
+@app.route('/status/<task_id>', methods=['GET'])
+def check_status(task_id):
+    """
+    Endpoint to check the status of a Celery task by its ID.
+    
+    Args:
+        task_id (str): The ID of the Celery task.
+    
+    Returns:
+        JSON response with task status and result (if completed).
+    """
+    task = perform_analysis.AsyncResult(task_id)
+    
+    if task.state == 'PENDING':
+        response = {"success": True, "status": "queued"}
+    elif task.state == 'STARTED':
+        response = {"success": True, "status": "processing"}
+    elif task.state == 'SUCCESS':
+        response = {"success": True, "status": "completed", "result": task.result}
+    elif task.state == 'FAILURE':
+        response = {"success": False, "status": "failed", "error": str(task.result)}
+    else:
+        response = {"success": False, "status": task.state}
+    
+    return jsonify(response), 200
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.getenv("PORT", 8000))
     debug = os.getenv("FLASK_DEBUG", "1") == "1"
     app.run(host='0.0.0.0', port=port, debug=debug)
