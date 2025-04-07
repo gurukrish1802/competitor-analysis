@@ -19,6 +19,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import threading
 from celery import Celery
+import redis
 
 # Load environment variables
 load_dotenv()
@@ -28,8 +29,9 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://hawkyai:1R9hdMHgV7OsdueE@clust
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyAGRJYtNIXE__r5GzAtziZsftbDDeQWoIo")
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Redis configuration for Celery
+# Base Redis URL without database number
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_BASE_URL = REDIS_URL.split('?')[0]  # Strip query parameters for base URL
 
 # Database settings
 database_name = os.getenv("DATABASE_NAME", "competitor_analysis_test")
@@ -180,14 +182,32 @@ VIDEO_RESPONSE_SCHEMA = {
 # Create Flask app
 app = Flask(__name__)
 
+# Test broker connection (DB 0)
+broker_url = f"{REDIS_URL}"
+try:
+    redis_client = redis.Redis.from_url(broker_url)
+    redis_client.ping()
+    print("Redis broker connection successful!")
+except Exception as e:
+    print(f"Redis broker connection failed: {e}")
+
+# Test backend connection (DB 1)
+backend_url = f"{REDIS_BASE_URL}/1{'?' + REDIS_URL.split('?')[1] if '?' in REDIS_URL else ''}"
+try:
+    redis_client = redis.Redis.from_url(backend_url)
+    redis_client.ping()
+    print("Redis backend connection successful!")
+except Exception as e:
+    print(f"Redis backend connection failed: {e}")
+
 # Configure Celery
 celery_app = Celery(
     'creative_extraction',
-    broker=f"{REDIS_URL}/0",
-    backend=f"{REDIS_URL}/1"
+    broker=f"{REDIS_BASE_URL}/0{'?' + REDIS_URL.split('?')[1] if '?' in REDIS_URL else ''}",  # Database 0 for broker
+    backend=f"{REDIS_BASE_URL}/1{'?' + REDIS_URL.split('?')[1] if '?' in REDIS_URL else ''}"  # Database 1 for backend
 )
 
-# Celery configuration
+# Celery configuration (unchanged)
 celery_app.conf.update(
     task_serializer='json',
     accept_content=['json'],
@@ -2508,4 +2528,11 @@ def check_status(task_id):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     debug = os.getenv("FLASK_DEBUG", "1") == "1"
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    # app.run(host='0.0.0.0', port=port, debug=debug)
+    app.run(
+        host='0.0.0.0',
+        port=443,
+        ssl_context=('server.crt', 'server.key')
+    )
+
+
