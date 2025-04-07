@@ -2528,11 +2528,7 @@ def check_status(task_id):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     debug = os.getenv("FLASK_DEBUG", "1") == "1"
-    # app.run(host='0.0.0.0', port=port, debug=debug)
-    app.run(
-        host='0.0.0.0',
-        port=443,
-        ssl_context=('server.crt', 'server.key')
-    )
+    app.run(host='0.0.0.0', port=port, debug=debug)
+    
 
 
