@@ -748,17 +748,37 @@ class CreativeAnalysis:
         - The writing style and voice used in the text
         - Visual style elements (e.g., minimalist, vibrant, corporate, playful)
 
-    18. Visual Focus:
+    18. Language:
+        - Primary language used in the creative
+        - Any secondary languages or multilingual elements
+        - Language style (formal, informal, technical, colloquial)
+        - Cultural language references or idioms
+
+    19. Subject Focus:
+        - Who is the primary subject of the creative (person, group, object)
+        - Subject's demographic characteristics (age, gender, ethnicity, etc.)
+        - Subject's emotional state and expressions
+        - Subject's positioning and prominence in the creative
+        - How the subject relates to the target audience
+
+    20. Product Focus and Placements:
+        - How products are featured in the creative
+        - Product placement strategy (central, peripheral, background)
+        - Product positioning relative to other elements
+        - Product emphasis techniques (size, color, lighting, framing)
+        - Product interaction with subjects or environment
+
+    21. Visual Focus:
         - The main visual element that draws attention
         - What the creative primarily focuses on visually
         - Visual hierarchy and how attention is directed through the creative
 
-    19. Product Analysis:
+    22. Product Analysis:
         - Product Categories: Look for any products shown in the creative and match them with these categories:
         {json.dumps(product_categories, indent=2)}
         - Product Features: List all specific features, technologies, or benefits shown or mentioned in the creative
         
-    20. Messaging Angle:
+    23. Messaging Angle:
         - The primary messaging approach used in the creative (e.g., emotional, rational, fear-based, solution-oriented)
         - How the message is framed (e.g., problem-solution, aspiration, testimonial, storytelling)
         - Specific messaging tactics used (e.g., social proof, scarcity, authority, urgency)
@@ -793,6 +813,26 @@ class CreativeAnalysis:
             "tone": "overall tone of the creative",
             "writing_style": "style of writing used",
             "visual_style": "visual style elements"
+        },
+        "language": {
+            "primary": "main language used",
+            "secondary": ["any additional languages"],
+            "style": "language style description",
+            "cultural_references": ["any cultural language elements"]
+        },
+        "subject_focus": {
+            "primary_subject": "main subject description",
+            "demographics": ["demographic characteristics"],
+            "emotional_state": "subject's emotional expression",
+            "positioning": "how subject is positioned",
+            "audience_relation": "how subject relates to target audience"
+        },
+        "product_focus": {
+            "featured_products": ["products prominently shown"],
+            "placement_strategy": "how products are placed",
+            "positioning": "product positioning description",
+            "emphasis_techniques": ["techniques used to emphasize products"],
+            "interaction": "how products interact with other elements"
         },
         "visual_focus": {
             "main_element": "primary visual element",
@@ -930,7 +970,10 @@ class CreativeAnalysis:
                     "- User Journey (Problem Framing, Solution Presentation, Benefit Demonstration)\n"
                     "- Product Categories (List all products shown in the video)\n"
                     "- Product Features (List all features and benefits shown)\n"
-                    "- Messaging Angle (Primary approach, message framing, messaging tactics, notable aspects)\n\n"
+                    "- Messaging Angle (Primary approach, message framing, messaging tactics, notable aspects)\n"
+                    "- Language (Primary language, secondary languages, language style, cultural references)\n"
+                    "- Subject Focus (Who is the primary subject, their demographics, emotional state, positioning, audience relation)\n"
+                    "- Product Focus and Placements (How products are featured, placement strategy, positioning, emphasis techniques, interaction)\n\n"
                     "IMPORTANT: You MUST include both product_categories and product_features arrays in your response.\n"
                     "Respond strictly in JSON format with ALL above fields, with keys arranged in alphabetical order."
                 )
